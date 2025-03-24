@@ -8,6 +8,7 @@ import sounddevice as sd
 import threading
 import logging
 import keyboard
+import os
 import torch
 from transformers import (
     WhisperForConditionalGeneration,
@@ -19,6 +20,8 @@ from transformers import logging as transformers_logging
 import warnings
 import time
 from termcolor import colored
+from silero_vad import load_silero_vad, get_speech_timestamps
+# import pyautogui
 # from colorama import Fore, init, Style
 
 # init(autoreset=True)
@@ -56,12 +59,15 @@ class TTSHandler:
         model_size: str = "large-v3",
         sample_rate: int = 16000,
         chunk_size: int = 1024,
+        audio_len: int = 2,
     ) -> None:
         self.model_size: str = model_size
         self.model, self.processor, self.device = self.whisper_setup()
+        self.silero_vad = load_silero_vad()
         self.buffer: NDArray[np.float16] = np.zeros((0,), dtype=np.float16)
         self.sample_rate: int = sample_rate
         self.chunk_size: int = chunk_size
+        self.audio_len: int = audio_len
 
         self.stop_event: threading.Event = threading.Event()
         self.recording_thread: threading.Thread = threading.Thread(
@@ -69,6 +75,13 @@ class TTSHandler:
         )
         self.transcription_thread: threading.Thread = threading.Thread(
             target=self.transcribe_audio, daemon=True
+        )
+        # self.clear_chat_thread: threading.Thread = threading.Thread(
+        #     target=self.clear_chat, daemon=True
+        # )
+
+        self.forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+            language="english", task="transcribe"
         )
 
     def whisper_setup(self) -> Tuple[PreTrainedModel, WhisperProcessor, torch.device]:
@@ -115,13 +128,17 @@ class TTSHandler:
         """
         logger.info("Transcription thread started...")
         while not self.stop_event.is_set():
-            if len(self.buffer) < self.sample_rate * 5:
+            if len(self.buffer) < self.sample_rate * self.audio_len:
                 continue
 
             logger.info("Transcribing...")
             buffer_copy: NDArray[np.float16] = self.buffer.copy()
             self.buffer = np.zeros((0,), dtype=np.float16)
+            if not self.is_speech(buffer_copy):
+                continue
 
+            print(" " * 14, end="\r")
+            print("Transcribing...")
             # segments, _ = self.model.transcribe(audio_data)
             # transcription: str = "".join(segment.text for segment in segments)
 
@@ -132,17 +149,25 @@ class TTSHandler:
             ).to(self.device)
             input_features: torch.Tensor = inputs["input_features"]
 
-            generated_ids = self.model.generate(input_features)
-            transcription: List[str] = self.processor.batch_decode(
-                generated_ids, skip_special_tokens=True, language="en"
+            generated_ids = self.model.generate(
+                input_features, forced_decoder_ids=self.forced_decoder_ids
             )
-            # pyautogui.typewrite(transcription)
+            transcription: List[str] = self.processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )
             if transcription:
+                # pyautogui.write(transcription[0].strip(), interval=0.01)
                 print(" " * 14, end="\r")
                 print(transcription[0].strip())
             # logger.info(
             #     "Transcription: %s", transcription[0]
             # ) if transcription else None
+
+    def is_speech(self, audio: NDArray[np.float16]) -> bool:
+        speech_timestamps = get_speech_timestamps(
+            torch.tensor(audio), self.silero_vad, return_seconds=True
+        )
+        return bool(speech_timestamps)
 
     def audio_callback(self, indata, frames, time, status) -> None:
         self.buffer = np.concatenate((self.buffer, indata[:, 0]))
@@ -201,19 +226,28 @@ class TTSHandler:
     #
     #         self.transcribe_audio(buffer_copy)
 
+    def clear_chat(self) -> None:
+        while not self.stop_event.is_set():
+            if keyboard.is_pressed("c"):
+                os.system("cls" if os.name == "nt" else "clear")
+
     def start_threads(self) -> None:
         self.recording_thread.start()
         self.transcription_thread.start()
+        # self.clear_chat_thread.start()
 
     def stop_threads(self) -> None:
         self.stop_event.set()
         self.recording_thread.join()
         self.transcription_thread.join()
+        # self.clear_chat_thread.join()
 
 
 if __name__ == "__main__":
+    interval_len: int = 5
+    print(f"Realtime speech to text with a {interval_len}s interval.")
     print("Wait until it says 'Speak now...'")
-    handler: TTSHandler = TTSHandler()
+    handler: TTSHandler = TTSHandler(audio_len=interval_len)
     handler.start_threads()
     try:
         keyboard.wait("esc")
